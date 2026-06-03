@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createServer, IncomingMessage, ServerResponse } from "http";
+import { timingSafeEqual } from "crypto";
 import { TRIATHLON_COACH_SYSTEM_PROMPT } from "./coach-prompt.js";
 import { tools, executeTool } from "./tools.js";
 
@@ -74,14 +75,46 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function json(res: ServerResponse, status: number, data: unknown) {
+function json(res: ServerResponse, status: number, data: unknown, extraHeaders: Record<string, string> = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    ...extraHeaders,
   });
   res.end(JSON.stringify(data));
+}
+
+// ── Basic Auth ──────────────────────────────────────────────────────
+
+const AUTH_USER = process.env.BASIC_AUTH_USER;
+const AUTH_PASS = process.env.BASIC_AUTH_PASS;
+const AUTH_ENABLED = Boolean(AUTH_USER && AUTH_PASS);
+
+function safeEqual(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
+
+function isAuthorized(req: IncomingMessage): boolean {
+  if (!AUTH_ENABLED) return true;
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Basic ")) return false;
+  const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+  const colonIdx = decoded.indexOf(":");
+  if (colonIdx < 0) return false;
+  const user = decoded.slice(0, colonIdx);
+  const pass = decoded.slice(colonIdx + 1);
+  return safeEqual(user, AUTH_USER!) && safeEqual(pass, AUTH_PASS!);
+}
+
+function unauthorized(res: ServerResponse) {
+  json(res, 401, { error: "Unauthorized" }, {
+    "WWW-Authenticate": 'Basic realm="triathlon-coach"',
+  });
 }
 
 // ── Server ──────────────────────────────────────────────────────────
@@ -90,6 +123,11 @@ const server = createServer(async (req, res) => {
   // CORS preflight
   if (req.method === "OPTIONS") {
     json(res, 204, null);
+    return;
+  }
+
+  if (!isAuthorized(req)) {
+    unauthorized(res);
     return;
   }
 
@@ -126,6 +164,7 @@ const server = createServer(async (req, res) => {
 const PORT = parseInt(process.env.PORT || "3000", 10);
 server.listen(PORT, () => {
   console.log(`Triathlon Coach API running on http://localhost:${PORT}`);
+  console.log(`Basic auth: ${AUTH_ENABLED ? "enabled" : "disabled (set BASIC_AUTH_USER + BASIC_AUTH_PASS)"}`);
   console.log(`\nEndpoints:`);
   console.log(`  POST /chat              { "message": "...", "session_id": "..." }`);
   console.log(`  DELETE /session/:id      Clear a session\n`);
